@@ -70,10 +70,12 @@ window.__ModuleLoader__.load({
     };
 
     // ---------- 快捷键规格 ----------
-    // Mac 默认 ⌘⇧K；Windows 默认 Ctrl+Alt+K（避开浏览器 Ctrl+Shift+K 的冲突）。
+    // Mac 默认 ⌘⇧K；Windows 桌面默认 Ctrl+Alt+K。
+    // 注意：Web 版的系统搜索快捷键占用 Cmd/Ctrl+Alt+K，因此 Web 上改用 Ctrl+Shift+K，避免注册时冲突。
     const SHORTCUT_KEY = 'dsh-sidebar-file-search:shortcut';
     const MAC_DEFAULT_SPEC = { code: 'KeyK', modifiers: ['primary', 'shift'] };
     const WIN_DEFAULT_SPEC = { code: 'KeyK', modifiers: ['control', 'alt'] };
+    const WEB_WIN_SPEC = { code: 'KeyK', modifiers: ['control', 'shift'] };
     const DEFAULT_SPEC = IS_WINDOWS ? WIN_DEFAULT_SPEC : MAC_DEFAULT_SPEC;
     const sameSpec = (a, b) => a.code === b.code && a.modifiers.length === b.modifiers.length && a.modifiers.every((mod) => b.modifiers.includes(mod));
     const loadSpec = () => {
@@ -424,22 +426,39 @@ window.__ModuleLoader__.load({
               platform === 'macos' ? (mod === 'control' ? 'primary' : mod) : (mod === 'primary' ? 'control' : mod)
             )),
           });
-          // 默认值按平台各用各的：Mac ⌘⇧K，Windows/Linux Ctrl+Alt+K；自定义值才原样跨平台映射。
+          // Web 版不和系统快捷键抢 Ctrl+Alt+K，统一降级为 Ctrl+Shift+K。
+          const webSpec = {
+            code: spec.code,
+            modifiers: spec.modifiers.map((mod) => (mod === 'alt' ? 'shift' : mod)),
+          };
+          // 默认值按平台各用各的：Mac ⌘⇧K，Windows/Linux 桌面 Ctrl+Alt+K。
           const bindings = sameSpec(spec, DEFAULT_SPEC)
             ? {
                 'desktop:macos': MAC_DEFAULT_SPEC,
                 'desktop:windows': WIN_DEFAULT_SPEC,
                 'desktop:linux': WIN_DEFAULT_SPEC,
                 'web:macos': MAC_DEFAULT_SPEC,
-                'web:windows': WIN_DEFAULT_SPEC,
+                'web:windows': WEB_WIN_SPEC,
               }
             : {
                 'desktop:macos': mk('macos'),
                 'desktop:windows': mk('windows'),
                 'desktop:linux': mk('linux'),
-                'web:macos': mk('macos'),
-                'web:windows': mk('windows'),
+                'web:macos': webSpec,
+                'web:windows': webSpec,
               };
+          // 清理上次热更新遗留的同名命令，避免重复注册被静默跳过（旧版本 id 为 file-search.open）。
+          try {
+            const registry = ctx.shortcuts.registry;
+            const commands = registry && registry.commands;
+            if (commands && typeof commands.delete === 'function') {
+              let changed = commands.delete('file-search.open');
+              changed = commands.delete('sidebar-file-search.open') || changed;
+              if (changed) registry.refreshLabels();
+            }
+          } catch (err) {
+            /* 拿不到内部表就交给下面的 register 处理 */
+          }
           try {
             disposeCurrent = ctx.shortcuts.register({
               id: 'sidebar-file-search.open',
