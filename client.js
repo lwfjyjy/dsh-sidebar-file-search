@@ -795,8 +795,14 @@ window.__ModuleLoader__.load({
                           renderHits(base, query),
                           c.kind === 'directory' ? h('span', { className: 'dsfs-name-slash' }, '/') : null,
                         ),
-                        // 选中行展示完整目录（不压缩、可换行），其余行展示压缩目录
-                        dir ? h('span', { className: 'dsfs-dir', title: dir }, renderDir(dir, query, i === active, full)) : null,
+                        // 选中行展示完整路径（含文件名，不压缩、可换行），其余行展示压缩目录
+                        i === active || dir
+                          ? h(
+                              'span',
+                              { className: 'dsfs-dir', title: i === active ? full : dir },
+                              renderDir(i === active ? full : dir, query, i === active, full),
+                            )
+                          : null,
                         i === active
                           ? h(
                               'span',
