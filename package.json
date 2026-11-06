@@ -1,0 +1,44 @@
+{
+  "name": "@lwfjyjy/dsh-file-search",
+  "version": "0.1.0",
+  "description": "DSH 插件：会话顶栏搜索按钮 + Vite 风格悬浮窗，按路径顺序模糊搜索工作区文件/文件夹，选中后在右侧预览打开。",
+  "type": "module",
+  "license": "MIT",
+  "author": "lwfjyjy",
+  "engines": {
+    "node": ">=24",
+    "dsh": ">=0.2.1-rc.5"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./client.js": "./client.js",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-api-session-controller",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}
