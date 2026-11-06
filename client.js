@@ -255,32 +255,45 @@ window.__ModuleLoader__.load({
         .map((x) => x.cand);
     };
 
-    // 面包屑路径 + 命中字符高亮
-    const renderPath = (path, query) => {
-      const pos = matchPositions(path, query);
-      const segs = path.split('/');
+    // VS Code 风格路径压缩：过长目录只保留「首段 + 末尾两段」，中间用 … 省略；
+    // 查询命中的目录段始终保留，避免高亮被省略。
+    const compressSegs = (segs, query) => {
+      if (segs.length <= 4) return segs;
+      const q = query.trim().toLowerCase();
+      const keep = new Set([0, segs.length - 2, segs.length - 1]);
+      if (q) segs.forEach((seg, i) => { if (seg.toLowerCase().includes(q)) keep.add(i); });
+      const out = [];
+      let last = -1;
+      [...keep].sort((a, b) => a - b).forEach((i) => {
+        if (last >= 0 && i > last + 1) out.push('…');
+        out.push(segs[i]);
+        last = i;
+      });
+      return out;
+    };
+
+    // 单段文字的高亮渲染（连续命中合并成一个 mark，避免出现缝隙）
+    const renderHits = (text, query) => {
+      const pos = matchPositions(text, query);
+      const out = [];
+      for (let j = 0; j < text.length; ) {
+        if (!pos.has(j)) { out.push(text[j]); j += 1; continue; }
+        let k = j;
+        while (k < text.length && pos.has(k)) k += 1;
+        out.push(h('mark', { key: j, className: 'dsfs-hit' }, text.slice(j, k)));
+        j = k;
+      }
+      return out;
+    };
+
+    // 渲染压缩后的目录（› 分隔 + 命中高亮）
+    const renderDir = (dir, query) => {
+      const segs = dir.split('/').filter(Boolean);
+      if (!segs.length) return [];
       const nodes = [];
-      let offset = 0;
-      segs.forEach((seg, si) => {
-        if (si > 0) {
-          nodes.push(h('span', { key: `sep-${si}`, className: 'dsfs-sep' }, '›'));
-          offset += 1;
-        }
-        const body = [];
-        for (let j = 0; j < seg.length; ) {
-          if (!pos.has(offset + j)) {
-            body.push(seg[j]);
-            j += 1;
-            continue;
-          }
-          // 连续的命中字符合成一个 mark，避免每字一个高亮块之间出现缝隙
-          let k = j;
-          while (k < seg.length && pos.has(offset + k)) k += 1;
-          body.push(h('mark', { key: j, className: 'dsfs-hit' }, seg.slice(j, k)));
-          j = k;
-        }
-        nodes.push(h('span', { key: `seg-${si}`, className: si === segs.length - 1 ? 'dsfs-name' : 'dsfs-dir' }, body));
-        offset += seg.length;
+      compressSegs(segs, query).forEach((seg, i) => {
+        if (i > 0) nodes.push(h('span', { key: `sep-${i}`, className: 'dsfs-sep' }, '›'));
+        nodes.push(h('span', { key: `seg-${i}`, className: 'dsfs-seg' }, seg === '…' ? '…' : renderHits(seg, query)));
       });
       return nodes;
     };
@@ -315,12 +328,13 @@ window.__ModuleLoader__.load({
       '.dsfs-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:var(--dsw-radius-md);color:var(--dsw-alias-label-primary);cursor:pointer}',
       `.dsfs-item.is-active{background:color-mix(in srgb,${ACCENT} 12%,transparent)}`,
       '.dsfs-item-icon{width:16px;height:16px;flex:none;color:var(--dsw-alias-label-secondary)}',
-      '.dsfs-path{flex:1;min-width:0;font-size:13px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.dsfs-name{flex:0 1 auto;min-width:0;max-width:70%;font-size:13px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-primary);font-weight:500}',
+      '.dsfs-name-slash{color:var(--dsw-alias-label-secondary);font-weight:400}',
+      '.dsfs-dir{flex:1;min-width:0;display:inline-flex;align-items:center;gap:4px;font-size:12px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-secondary)}',
+      '.dsfs-seg{overflow:hidden;text-overflow:ellipsis}',
       '.dsfs-item-hint{flex:none;display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--dsw-alias-label-secondary)}',
       '.dsfs-item-hint kbd{display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:18px;padding:0 4px;border-radius:var(--dsw-radius-xs);border:1px solid var(--dsw-alias-border-l2);font-family:var(--dsw-font-family,inherit);font-size:11px;line-height:1}',
-      '.dsfs-dir{color:var(--dsw-alias-label-secondary)}',
-      '.dsfs-name{color:var(--dsw-alias-label-primary)}',
-      '.dsfs-sep{margin:0 4px;color:var(--dsw-alias-label-secondary);opacity:.6}',
+      '.dsfs-sep{margin:0 4px;color:var(--dsw-alias-label-secondary);opacity:.6;flex:none}',
       `.dsfs-hit{background:color-mix(in srgb,${ACCENT} 22%,transparent);color:${ACCENT};border-radius:2px;padding:0;font-weight:600}`,
       '.dsfs-empty{padding:26px 12px;text-align:center;color:var(--dsw-alias-label-secondary);font-size:13px}',
       '.dsfs-foot{display:flex;align-items:center;gap:16px;padding:8px 14px;border-top:1px solid var(--dsw-alias-border-l2);color:var(--dsw-alias-label-secondary);font-size:11px}',
@@ -740,8 +754,12 @@ window.__ModuleLoader__.load({
                 ? h('div', { className: 'dsfs-empty' }, t('hint'))
                 : showEmpty
                   ? h('div', { className: 'dsfs-empty' }, loading ? t('loading') : t('empty'))
-                  : results.map((c, i) =>
-                      h(
+                  : results.map((c, i) => {
+                      const full = String(c.path || '').replace(/\\/g, '/');
+                      const cut = full.lastIndexOf('/');
+                      const dir = cut < 0 ? '' : full.slice(0, cut);
+                      const base = full.slice(cut + 1);
+                      return h(
                         'div',
                         {
                           key: `${c.path}|${c.kind}|${i}`,
@@ -756,7 +774,14 @@ window.__ModuleLoader__.load({
                           },
                         },
                         c.kind === 'directory' ? h(FolderGlyph) : h(FileGlyph),
-                        h('span', { className: 'dsfs-path' }, renderPath(c.path, query)),
+                        // 文件名优先，目录压缩后放在右侧（VS Code 快速打开的感觉）
+                        h(
+                          'span',
+                          { className: 'dsfs-name', title: c.path },
+                          renderHits(base, query),
+                          c.kind === 'directory' ? h('span', { className: 'dsfs-name-slash' }, '/') : null,
+                        ),
+                        dir ? h('span', { className: 'dsfs-dir', title: dir }, renderDir(dir, query)) : null,
                         i === active
                           ? h(
                               'span',
@@ -766,8 +791,8 @@ window.__ModuleLoader__.load({
                               t('insertHint'),
                             )
                           : null,
-                      ),
-                    ),
+                      );
+                    }),
             ),
             h(
               'div',
