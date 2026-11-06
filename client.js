@@ -272,28 +272,35 @@ window.__ModuleLoader__.load({
       return out;
     };
 
-    // 单段文字的高亮渲染（连续命中合并成一个 mark，避免出现缝隙）
-    const renderHits = (text, query) => {
-      const pos = matchPositions(text, query);
+    // 按给定命中位置渲染一段文字（连续命中合并成一个 mark，避免出现缝隙）
+    const renderHitsAt = (text, pos, base) => {
       const out = [];
       for (let j = 0; j < text.length; ) {
-        if (!pos.has(j)) { out.push(text[j]); j += 1; continue; }
+        if (!pos.has(base + j)) { out.push(text[j]); j += 1; continue; }
         let k = j;
-        while (k < text.length && pos.has(k)) k += 1;
+        while (k < text.length && pos.has(base + k)) k += 1;
         out.push(h('mark', { key: j, className: 'dsfs-hit' }, text.slice(j, k)));
         j = k;
       }
       return out;
     };
 
-    // 渲染压缩后的目录（› 分隔 + 命中高亮）
-    const renderDir = (dir, query) => {
+    // 单段文字的高亮渲染
+    const renderHits = (text, query) => renderHitsAt(text, matchPositions(text, query), 0);
+
+    // 渲染目录（› 分隔 + 命中高亮）；full=true 时不压缩，用于选中行展示全路径，
+    // 此时按整条目录路径计算命中位置，跨目录段的匹配也能正确高亮。
+    const renderDir = (dir, query, full, source) => {
       const segs = dir.split('/').filter(Boolean);
       if (!segs.length) return [];
       const nodes = [];
-      compressSegs(segs, query).forEach((seg, i) => {
+      const pos = full ? matchPositions(source || dir, query) : null;
+      let offset = 0;
+      (full ? segs : compressSegs(segs, query)).forEach((seg, i) => {
         if (i > 0) nodes.push(h('span', { key: `sep-${i}`, className: 'dsfs-sep' }, '›'));
-        nodes.push(h('span', { key: `seg-${i}`, className: 'dsfs-seg' }, seg === '…' ? '…' : renderHits(seg, query)));
+        const body = seg === '…' ? '…' : full ? renderHitsAt(seg, pos, offset) : renderHits(seg, query);
+        nodes.push(h('span', { key: `seg-${i}`, className: 'dsfs-seg' }, body));
+        if (full) offset += seg.length + 1;
       });
       return nodes;
     };
@@ -326,7 +333,11 @@ window.__ModuleLoader__.load({
       '@keyframes dsfs-spin{to{transform:rotate(360deg)}}',
       '.dsfs-list{flex:1;min-height:0;overflow-y:auto;padding:6px}',
       '.dsfs-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:var(--dsw-radius-md);color:var(--dsw-alias-label-primary);cursor:pointer}',
-      `.dsfs-item.is-active{background:color-mix(in srgb,${ACCENT} 12%,transparent)}`,
+      `.dsfs-item.is-active{background:color-mix(in srgb,${ACCENT} 12%,transparent);flex-wrap:wrap;align-items:flex-start}`,
+      '.dsfs-item.is-active .dsfs-name{max-width:calc(100% - 96px)}',
+      '.dsfs-item.is-active .dsfs-item-hint{order:2;margin-left:auto}',
+      '.dsfs-item.is-active .dsfs-dir{order:3;flex:1 0 100%;box-sizing:border-box;padding-left:24px;display:block;font-size:11px;line-height:1.5;white-space:normal;word-break:break-all;overflow:visible;text-overflow:clip}',
+      '.dsfs-item.is-active .dsfs-dir .dsfs-seg{overflow:visible;text-overflow:clip}',
       '.dsfs-item-icon{width:16px;height:16px;flex:none;color:var(--dsw-alias-label-secondary)}',
       '.dsfs-name{flex:0 1 auto;min-width:0;max-width:70%;font-size:13px;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dsw-alias-label-primary);font-weight:500}',
       '.dsfs-name-slash{color:var(--dsw-alias-label-secondary);font-weight:400}',
@@ -401,7 +412,10 @@ window.__ModuleLoader__.load({
         // 其余平台 primary=Ctrl；不声明 web:linux（该组合不在浏览器白名单内）。
         const mk = (platform) => ({
           code: spec.code,
-          modifiers: spec.modifiers.map((m) => (m === 'control' && platform === 'macos' ? 'primary' : m)),
+          // primary 在 macOS 是 ⌘、其他平台是 Ctrl；跨平台默认值做等价映射
+          modifiers: spec.modifiers.map((m) =>
+            platform === 'macos' ? (m === 'control' ? 'primary' : m) : (m === 'primary' ? 'control' : m),
+          ),
         });
         try {
           disposeShortcut = ctx.shortcuts.register({
@@ -781,7 +795,8 @@ window.__ModuleLoader__.load({
                           renderHits(base, query),
                           c.kind === 'directory' ? h('span', { className: 'dsfs-name-slash' }, '/') : null,
                         ),
-                        dir ? h('span', { className: 'dsfs-dir', title: dir }, renderDir(dir, query)) : null,
+                        // 选中行展示完整目录（不压缩、可换行），其余行展示压缩目录
+                        dir ? h('span', { className: 'dsfs-dir', title: dir }, renderDir(dir, query, i === active, full)) : null,
                         i === active
                           ? h(
                               'span',
