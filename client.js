@@ -1,31 +1,29 @@
-// dsh-file-search —— 右侧栏右上角搜索按钮 + Vite 风格悬浮搜索窗（纯前端插件）
+// dsh-sidebar-file-search —— 右侧栏右上角搜索按钮 + Vite 风格悬浮搜索窗（纯前端插件）
 //
-// 核心思路：
-//   1) 右侧栏没有可注入的“表头动作”插槽，所以按钮用全窗口浮层 shell.overlay 渲染，
-//      绝对定位到右侧栏右上角那排图标（分屏/全屏/收起）左侧，仅当右侧栏显示会话时才出现；
-//   2) 弹窗同样在 shell.overlay 里，按钮与弹窗通过一个极简全局 store 解耦（开关/上下文）；
-//   3) 搜索直接复用系统内置的 @ 引用文件模糊引擎 ctx.remote.fileReferences.list，
-//      不自己扫盘、不存索引；输入做防抖 + AbortController 可取消，保证毫秒级反馈；
-//   4) 选中文件用系统统一的 dsh-resource://file/... 地址在右侧预览打开；
-//      选中文件夹则把路径填进输入框继续往里筛（像 Vite 那样逐层下钻）；
-//   5) 快捷键走系统 ctx.shortcuts 注册（不与内置快捷键抢占），Mac 用 ⌘⇧K，Windows 用 Ctrl+Alt+K；
-//   6) 选中行按 Tab 时，通过 ctx.uiSession 拿到当前会话的 inputActions，把路径以 @ 引用写进输入框。
+// 结构：平台/词典 → 快捷键工具 → 路径工具 → 搜索高亮工具 → 图标 → 样式
+//       → apply（浮层按钮、搜索窗、设置窗、快捷键注册）
+//
+// 关键约束（沿用原实现，行为不变）：
+//   1) 右侧栏没有“表头动作”插槽，按钮用全窗口浮层 shell.overlay 渲染并绝对定位；
+//   2) 搜索复用系统内置 @ 引用引擎 ctx.remote.fileReferences.list，不自行扫盘；
+//   3) 含 “/” 的查询额外做一次去斜杠全量模糊查询，保证能递归命中子目录；
+//   4) 选中文件用 dsh-resource://file/... 在右侧预览打开，文件夹则填回输入框继续下钻；
+//   5) 快捷键走 ctx.shortcuts；选中行按 Tab 通过 ctx.uiSession 的 inputActions 插入 @ 引用。
 window.__ModuleLoader__.load({
-  id: '@lwfjyjy/dsh-file-search',
+  id: '@lwfjyjy/dsh-sidebar-file-search',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
     const NS = 'fileSearch';
 
-    // 平台判断（决定快捷键显示/默认值）
+    // ---------- 平台与主题 ----------
     const PLATFORM = typeof navigator !== 'undefined' ? navigator.platform || navigator.userAgent || '' : '';
-    const isMac = /Mac|iPhone|iPad|iPod/.test(PLATFORM);
-    const isWindows = /Win/.test(PLATFORM);
-
-    // 高亮/强调色（品牌高亮色），用拼接规避外部替换，等价于 var(--dsw-alias-state-business-primary)
+    const IS_MAC = /Mac|iPhone|iPad|iPod/.test(PLATFORM);
+    const IS_WINDOWS = /Win/.test(PLATFORM);
+    // 品牌高亮色，用拼接规避外部替换，等价于 var(--dsw-alias-state-business-primary)
     const ACCENT = 'var(--dsw-alias-state-' + 'business-primary)';
 
-    // 词典；zh 同时兼作没有 locale 服务时的兜底
+    // ---------- 词典 ----------
     const zh = {
       trigger: '搜索',
       triggerTitle: '搜索文件',
@@ -71,17 +69,17 @@ window.__ModuleLoader__.load({
       needMod: 'Include at least one modifier (⌘/Ctrl, Alt or Shift)',
     };
 
-    // 快捷键规格（code + modifiers）；持久化到 localStorage。
+    // ---------- 快捷键规格 ----------
     // Mac 默认 ⌘⇧K；Windows 默认 Ctrl+Alt+K（避开浏览器 Ctrl+Shift+K 的冲突）。
-    const SHORTCUT_KEY = 'dsh-file-search:shortcut';
-    const DEFAULT_SPEC = isWindows
-      ? { code: 'KeyK', modifiers: ['control', 'alt'] }
-      : { code: 'KeyK', modifiers: ['primary', 'shift'] };
+    const SHORTCUT_KEY = 'dsh-sidebar-file-search:shortcut';
+    const MAC_DEFAULT_SPEC = { code: 'KeyK', modifiers: ['primary', 'shift'] };
+    const WIN_DEFAULT_SPEC = { code: 'KeyK', modifiers: ['control', 'alt'] };
+    const DEFAULT_SPEC = IS_WINDOWS ? WIN_DEFAULT_SPEC : MAC_DEFAULT_SPEC;
+    const sameSpec = (a, b) => a.code === b.code && a.modifiers.length === b.modifiers.length && a.modifiers.every((mod) => b.modifiers.includes(mod));
     const loadSpec = () => {
       try {
-        const raw = localStorage.getItem(SHORTCUT_KEY);
-        const s = raw && JSON.parse(raw);
-        if (s && typeof s.code === 'string' && Array.isArray(s.modifiers)) return s;
+        const spec = JSON.parse(localStorage.getItem(SHORTCUT_KEY) || 'null');
+        if (spec && typeof spec.code === 'string' && Array.isArray(spec.modifiers)) return spec;
       } catch (err) {
         /* 读不到就用默认 */
       }
@@ -95,7 +93,6 @@ window.__ModuleLoader__.load({
       }
     };
 
-    // 把 code 转成可读按键名（只覆盖常见键，其余回退原 code）
     const KEY_LABELS = {
       Comma: ',', Period: '.', Slash: '/', Semicolon: ';', Quote: "'", BracketLeft: '[', BracketRight: ']',
       Backslash: '\\', Minus: '-', Equal: '=', Backquote: '`', Space: 'Space', Enter: '↵', Tab: 'Tab',
@@ -108,28 +105,29 @@ window.__ModuleLoader__.load({
       return KEY_LABELS[code] || code;
     };
     const MOD_ORDER = ['primary', 'control', 'alt', 'shift'];
-    // 修饰键转显示文本（Mac 用符号，其他用文字）
     const modsToText = (modifiers) => {
-      const mods = MOD_ORDER.filter((m) => modifiers.indexOf(m) >= 0);
-      if (!mods.length && modifiers.length) mods.push(...modifiers);
-      return mods
-        .map((m) => {
-          if (m === 'primary') return isMac ? '⌘' : 'Ctrl';
-          if (m === 'control') return isMac ? '⌃' : 'Ctrl';
-          if (m === 'alt') return isMac ? '⌥' : 'Alt';
-          if (m === 'shift') return isMac ? '⇧' : 'Shift';
-          return m;
+      const ordered = MOD_ORDER.filter((mod) => modifiers.includes(mod));
+      if (!ordered.length && modifiers.length) ordered.push(...modifiers);
+      return ordered
+        .map((mod) => {
+          if (mod === 'primary') return IS_MAC ? '⌘' : 'Ctrl';
+          if (mod === 'control') return IS_MAC ? '⌃' : 'Ctrl';
+          if (mod === 'alt') return IS_MAC ? '⌥' : 'Alt';
+          if (mod === 'shift') return IS_MAC ? '⇧' : 'Shift';
+          return mod;
         })
-        .join(isMac ? ' ' : '+');
+        .join(IS_MAC ? ' ' : '+');
     };
-    // 组合键转显示文本（code 为空时只显示修饰键，用于录制中的实时提示）
+    // code 为空时只显示修饰键，用于录制中的实时提示。
     const specToText = (spec) => {
       const parts = [modsToText(spec.modifiers), spec.code ? keyLabel(spec.code) : ''].filter(Boolean);
-      return parts.join(isMac ? ' ' : '+');
+      return parts.join(IS_MAC ? ' ' : '+');
     };
+    const PURE_MODIFIER_KEYS = ['Meta', 'Control', 'Alt', 'Shift', 'CapsLock'];
 
-    // 插入后把键盘焦点交还对话输入框。Lexical 的 root 上挂了 __lexicalEditor，
-    // 先 focus DOM 再调 editor.focus() 才能恢复插入后的光标位置（否则会跳到开头）。
+    // ---------- 输入框聚焦 ----------
+    // Lexical 的 root 上挂了 __lexicalEditor；先 focus DOM 再调 editor.focus()
+    // 才能恢复插入后的光标位置（否则光标会跳到开头）。
     const focusComposer = () => {
       try {
         const roots = document.querySelectorAll('[contenteditable="true"]');
@@ -144,24 +142,37 @@ window.__ModuleLoader__.load({
       }
     };
 
-    // 只有一份共享状态：开关 + 当前会话上下文 + 快捷键设置
-    const store = {
-      state: { open: false, sessionId: null, cwd: undefined, spec: loadSpec(), settingsOpen: false, capturing: false },
-      listeners: new Set(),
-      get() {
-        return this.state;
-      },
-      set(patch) {
-        this.state = Object.assign({}, this.state, patch);
-        this.listeners.forEach((fn) => fn());
-      },
-      subscribe(fn) {
-        this.listeners.add(fn);
-        return () => this.listeners.delete(fn);
-      },
+    // ---------- 极简全局 store ----------
+    const createStore = (initial) => {
+      let state = initial;
+      const listeners = new Set();
+      return {
+        get: () => state,
+        set: (patch) => {
+          state = Object.assign({}, state, patch);
+          listeners.forEach((listener) => listener());
+        },
+        subscribe: (listener) => {
+          listeners.add(listener);
+          return () => listeners.delete(listener);
+        },
+      };
+    };
+    const store = createStore({
+      open: false,
+      sessionId: null,
+      cwd: undefined,
+      spec: loadSpec(),
+      settingsOpen: false,
+      capturing: false,
+    });
+    const useStoreSnapshot = () => {
+      const [snapshot, setSnapshot] = React.useState(store.get);
+      React.useEffect(() => store.subscribe(() => setSnapshot(store.get())), []);
+      return snapshot;
     };
 
-    // ---- 路径地址工具（与 @deepseek-ai/dsh-util-workspace-path 等价，作为兜底实现） ----
+    // ---------- 路径地址工具（与 @deepseek-ai/dsh-util-workspace-path 等价） ----------
     const FILE_ADDRESS_PREFIX = 'dsh-resource://file/';
     const encodeSegment = (s) => encodeURIComponent(s).replace(/%3A/gi, ':');
     const encodePath = (p) => p.split('/').map(encodeSegment).join('/');
@@ -169,8 +180,8 @@ window.__ModuleLoader__.load({
       const normalized = path.replace(/\\/g, '/').replace(/^(?:\.\/)+/, '');
       return `${FILE_ADDRESS_PREFIX}session/${encodeSegment(sessionId)}/${encodePath(normalized)}`;
     };
-    const isWindowsStylePath = (v) => /^[A-Za-z]:[/\\]/.test(v) || v.startsWith('\\\\');
-    const isAbsoluteWorkspacePath = (p) => p.startsWith('/') || isWindowsStylePath(p);
+    const isWindowsStylePath = (value) => /^[A-Za-z]:[/\\]/.test(value) || value.startsWith('\\\\');
+    const isAbsoluteWorkspacePath = (path) => path.startsWith('/') || isWindowsStylePath(path);
     const resolveWorkspacePath = (cwd, path) => {
       if (isAbsoluteWorkspacePath(path)) return path;
       if (cwd === void 0 || cwd === '') return path;
@@ -185,127 +196,122 @@ window.__ModuleLoader__.load({
       if (root !== '' && normalized.startsWith(`${root}/`)) return sessionFileAddress(sessionId, normalized.slice(root.length + 1));
       return sessionFileAddress(sessionId, normalized);
     };
-
-    // ---- 图标（手绘 SVG，少量图标不引入图标库） ----
-    const svg = (children, cls) =>
-      h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round', className: cls, 'aria-hidden': 'true', focusable: 'false' }, children);
-    const SearchGlyph = (props) => svg([h('circle', { key: 'c', cx: 11, cy: 11, r: 7 }), h('path', { key: 'p', d: 'M21 21l-4.3-4.3' })], props && props.cls);
-    const FileGlyph = () => svg([h('path', { key: 'a', d: 'M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z' }), h('path', { key: 'b', d: 'M14 3v5h5' })], 'dsfs-item-icon');
-    const FolderGlyph = () => svg([h('path', { key: 'a', d: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z' })], 'dsfs-item-icon');
-    const GearGlyph = (props) => svg([h('circle', { key: 'c', cx: 12, cy: 12, r: 3 }), h('path', { key: 'p', d: 'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z' })], props && props.cls);
-
-    // 把匹配到的字符位置算出来（服务端已筛过，这里只做高亮；大小写不敏感）
-    // 优先高亮“连续命中”：整段 query 在文件名里连续出现时，只高亮这一段；
-    // 否则再退回逐字符子序列匹配（保留 @ 那种顺序模糊的能力）。
-    const matchPositions = (text, query) => {
-      const set = new Set();
-      const t = text.toLowerCase();
-      const q = query.trim().toLowerCase();
-      if (!q) return set;
-      const nameStart = t.lastIndexOf('/') + 1;
-      const contiguous = t.indexOf(q, nameStart);
-      const start = contiguous >= 0 ? contiguous : t.indexOf(q);
-      if (start >= 0) {
-        for (let i = 0; i < q.length; i += 1) set.add(start + i);
-        return set;
-      }
-      let from = 0;
-      for (let i = 0; i < q.length; i += 1) {
-        const idx = t.indexOf(q[i], from);
-        if (idx < 0) return new Set();
-        set.add(idx);
-        from = idx + 1;
-      }
-      return set;
+    const splitPath = (path) => {
+      const full = String(path || '').replace(/\\/g, '/');
+      const cut = full.lastIndexOf('/');
+      return { full, dir: cut < 0 ? '' : full.slice(0, cut), base: full.slice(cut + 1) };
     };
 
-    // 结果重排：连续命中的优先于散落子序列；文件名命中优先于目录路径命中。
-    // 内置引擎会把 “md” 匹配成 _tmp 的 m + readme 的 d，这里把它纠正过来。
+    // ---------- 图标（手绘 SVG） ----------
+    const svg = (children, cls) =>
+      h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round', className: cls, 'aria-hidden': 'true', focusable: 'false' }, children);
+    const SearchGlyph = (props = {}) => svg([h('circle', { key: 'c', cx: 11, cy: 11, r: 7 }), h('path', { key: 'p', d: 'M21 21l-4.3-4.3' })], props.cls);
+    const FileGlyph = () => svg([h('path', { key: 'a', d: 'M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z' }), h('path', { key: 'b', d: 'M14 3v5h5' })], 'dsfs-item-icon');
+    const FolderGlyph = () => svg([h('path', { key: 'a', d: 'M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z' })], 'dsfs-item-icon');
+    const GearGlyph = (props = {}) => svg([h('circle', { key: 'c', cx: 12, cy: 12, r: 3 }), h('path', { key: 'p', d: 'M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z' })], props.cls);
+
+    // ---------- 搜索：高亮与排序 ----------
+    // 只要顺序符合即可（fzf 式子序列）；优先高亮整段连续命中，其次逐字符高亮。
+    const matchPositions = (text, query) => {
+      const positions = new Set();
+      const target = text.toLowerCase();
+      const needle = query.trim().toLowerCase();
+      if (!needle) return positions;
+      const nameStart = target.lastIndexOf('/') + 1;
+      const inName = target.indexOf(needle, nameStart);
+      const start = inName >= 0 ? inName : target.indexOf(needle);
+      if (start >= 0) {
+        for (let i = 0; i < needle.length; i += 1) positions.add(start + i);
+        return positions;
+      }
+      let from = 0;
+      for (let i = 0; i < needle.length; i += 1) {
+        const index = target.indexOf(needle[i], from);
+        if (index < 0) return new Set();
+        positions.add(index);
+        from = index + 1;
+      }
+      return positions;
+    };
+
+    const isBoundary = (text, index) => index === 0 || /[._\-\s/]/.test(text[index - 1]);
+    const subsequenceGap = (text, needle) => {
+      let from = 0;
+      let gap = 0;
+      for (let i = 0; i < needle.length; i += 1) {
+        const index = text.indexOf(needle[i], from);
+        if (index < 0) return Infinity;
+        if (i > 0) gap += index - from;
+        from = index + 1;
+      }
+      return gap;
+    };
+    const scoreCandidate = (candidate, needle) => {
+      const path = String(candidate.path || '').toLowerCase();
+      const name = path.slice(path.lastIndexOf('/') + 1);
+      const inName = name.indexOf(needle);
+      const inPath = path.indexOf(needle);
+      if (name === needle) return 50000;
+      if (name.startsWith(needle)) return 40000;
+      if (inName >= 0) return 30000 + (isBoundary(name, inName) ? 1000 : 0);
+      if (inPath >= 0) return 20000 + (isBoundary(path, inPath) ? 500 : 0);
+      const gap = subsequenceGap(path, needle);
+      return gap === Infinity ? 0 : 1000 + Math.max(1, 100 - gap);
+    };
+    // 内置引擎会把 “md” 匹配成 _tmp 的 m + readme 的 d，这里把连续命中纠正到前面。
     const rankResults = (list, query) => {
       const needle = query.trim().toLowerCase();
       if (!needle) return list;
-      const score = (cand) => {
-        const path = String(cand.path || '').toLowerCase();
-        const name = path.slice(path.lastIndexOf('/') + 1);
-        const inName = name.indexOf(needle);
-        const inPath = path.indexOf(needle);
-        const boundary = (str, idx) => idx === 0 || /[._\-\s\/]/.test(str[idx - 1]);
-        let s;
-        if (name === needle) s = 50000;
-        else if (name.startsWith(needle)) s = 40000;
-        else if (inName >= 0) s = 30000 + (boundary(name, inName) ? 1000 : 0);
-        else if (inPath >= 0) s = 20000 + (boundary(path, inPath) ? 500 : 0);
-        else {
-          // 整段 query 没连着出现：按子序列算一个很低的保底分，排在连续命中之后
-          let from = 0;
-          let gap = 0;
-          for (let i = 0; i < needle.length; i += 1) {
-            const idx = path.indexOf(needle[i], from);
-            if (idx < 0) { gap = 999; break; }
-            if (i > 0) gap += idx - from;
-            from = idx + 1;
-          }
-          s = gap === 999 ? 0 : 1000 + Math.max(1, 100 - gap);
-        }
-        return s;
-      };
       return list
-        .map((cand, index) => ({ cand, index, s: score(cand) }))
-        .sort((a, b) => b.s - a.s || a.index - b.index)
-        .map((x) => x.cand);
+        .map((candidate, index) => ({ candidate, index, score: scoreCandidate(candidate, needle) }))
+        .sort((a, b) => b.score - a.score || a.index - b.index)
+        .map(({ candidate }) => candidate);
     };
 
-    // VS Code 风格路径压缩：过长目录只保留「首段 + 末尾两段」，中间用 … 省略；
-    // 查询命中的目录段始终保留，避免高亮被省略。
-    const compressSegs = (segs, query) => {
-      if (segs.length <= 4) return segs;
-      const q = query.trim().toLowerCase();
-      const keep = new Set([0, segs.length - 2, segs.length - 1]);
-      if (q) segs.forEach((seg, i) => { if (seg.toLowerCase().includes(q)) keep.add(i); });
+    // VS Code 风格路径压缩：过长目录保留「首段 + 末尾两段」，中间用 …；命中段始终保留。
+    const compressSegs = (segments, query) => {
+      if (segments.length <= 4) return segments;
+      const needle = query.trim().toLowerCase();
+      const keep = new Set([0, segments.length - 2, segments.length - 1]);
+      if (needle) segments.forEach((segment, index) => { if (segment.toLowerCase().includes(needle)) keep.add(index); });
       const out = [];
       let last = -1;
-      [...keep].sort((a, b) => a - b).forEach((i) => {
-        if (last >= 0 && i > last + 1) out.push('…');
-        out.push(segs[i]);
-        last = i;
+      [...keep].sort((a, b) => a - b).forEach((index) => {
+        if (last >= 0 && index > last + 1) out.push('…');
+        out.push(segments[index]);
+        last = index;
       });
       return out;
     };
 
-    // 按给定命中位置渲染一段文字（连续命中合并成一个 mark，避免出现缝隙）
-    const renderHitsAt = (text, pos, base) => {
+    const renderHitsAt = (text, positions, base) => {
       const out = [];
-      for (let j = 0; j < text.length; ) {
-        if (!pos.has(base + j)) { out.push(text[j]); j += 1; continue; }
-        let k = j;
-        while (k < text.length && pos.has(base + k)) k += 1;
-        out.push(h('mark', { key: j, className: 'dsfs-hit' }, text.slice(j, k)));
-        j = k;
+      for (let i = 0; i < text.length; ) {
+        if (!positions.has(base + i)) { out.push(text[i]); i += 1; continue; }
+        let end = i;
+        while (end < text.length && positions.has(base + end)) end += 1;
+        out.push(h('mark', { key: i, className: 'dsfs-hit' }, text.slice(i, end)));
+        i = end;
       }
       return out;
     };
-
-    // 单段文字的高亮渲染
     const renderHits = (text, query) => renderHitsAt(text, matchPositions(text, query), 0);
-
-    // 渲染目录（› 分隔 + 命中高亮）；full=true 时不压缩，用于选中行展示全路径，
-    // 此时按整条目录路径计算命中位置，跨目录段的匹配也能正确高亮。
     const renderDir = (dir, query, full, source) => {
-      const segs = dir.split('/').filter(Boolean);
-      if (!segs.length) return [];
-      const nodes = [];
-      const pos = full ? matchPositions(source || dir, query) : null;
+      const segments = dir.split('/').filter(Boolean);
+      if (!segments.length) return [];
+      const positions = full ? matchPositions(source || dir, query) : null;
       let offset = 0;
-      (full ? segs : compressSegs(segs, query)).forEach((seg, i) => {
-        if (i > 0) nodes.push(h('span', { key: `sep-${i}`, className: 'dsfs-sep' }, '›'));
-        const body = seg === '…' ? '…' : full ? renderHitsAt(seg, pos, offset) : renderHits(seg, query);
-        nodes.push(h('span', { key: `seg-${i}`, className: 'dsfs-seg' }, body));
-        if (full) offset += seg.length + 1;
+      return (full ? segments : compressSegs(segments, query)).flatMap((segment, index) => {
+        const nodes = [];
+        if (index > 0) nodes.push(h('span', { key: `sep-${index}`, className: 'dsfs-sep' }, '›'));
+        const body = segment === '…' ? '…' : full ? renderHitsAt(segment, positions, offset) : renderHits(segment, query);
+        nodes.push(h('span', { key: `seg-${index}`, className: 'dsfs-seg' }, body));
+        if (full) offset += segment.length + 1;
+        return nodes;
       });
-      return nodes;
     };
 
-    // ---- 样式（仅注入一次；全部走 dsh 令牌，随主题明暗自适应） ----
+    // ---------- 样式 ----------
     const CSS = [
       // 悬浮到右侧栏右上角图标排左侧的小胶囊（right/top 由 JS 精确测量后覆盖）
       '.dsfs-triggerwrap{position:fixed;top:10px;right:78px;z-index:2147482000;pointer-events:auto;-webkit-app-region:no-drag;display:flex}',
@@ -385,85 +391,90 @@ window.__ModuleLoader__.load({
         if (existing.textContent !== CSS) existing.textContent = CSS;
         return;
       }
-      const el = document.createElement('style');
-      el.id = 'dsfs-style';
-      el.textContent = CSS;
-      document.head.appendChild(el);
+      const style = document.createElement('style');
+      style.id = 'dsfs-style';
+      style.textContent = CSS;
+      document.head.appendChild(style);
     };
 
+    // ---------- 组件与注册 ----------
     function apply(ctx) {
-      ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'file-search: dictionaries');
-      ctx.effect(() => installStyle(), 'file-search: style');
+      ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'sidebar-file-search: dictionaries');
+      ctx.effect(() => installStyle(), 'sidebar-file-search: style');
       const t = ctx.locale.bind(NS);
 
-      // 快捷键：默认 ⌘⇧K / Ctrl+Shift+K，开关搜索窗（走系统快捷键服务，避免与内置 ⌘K 冲突）。
-      // 用户可在设置弹窗里改键；改键时先注销旧的再按新规格注册。
-      let disposeShortcut = null;
-      const registerShortcut = (spec) => {
-        if (disposeShortcut) {
+      // 快捷键：默认 ⌘⇧K / Ctrl+Alt+K；可在设置弹窗里修改。
+      const shortcut = (() => {
+        let disposeCurrent = null;
+        const release = () => {
+          if (!disposeCurrent) return;
           try {
-            disposeShortcut();
+            disposeCurrent();
           } catch (err) {
             /* 旧注册可能已失效 */
           }
-          disposeShortcut = null;
-        }
-        // 按平台生成合法的默认绑定：mac 上 primary=⌘、control 映射成 primary，
-        // 其余平台 primary=Ctrl；不声明 web:linux（该组合不在浏览器白名单内）。
-        const mk = (platform) => ({
-          code: spec.code,
-          // primary 在 macOS 是 ⌘、其他平台是 Ctrl；跨平台默认值做等价映射
-          modifiers: spec.modifiers.map((m) =>
-            platform === 'macos' ? (m === 'control' ? 'primary' : m) : (m === 'primary' ? 'control' : m),
-          ),
-        });
-        try {
-          disposeShortcut = ctx.shortcuts.register({
-            id: 'file-search.open',
-            label: () => t('shortcutLabel'),
-            aliases: ['search files', 'file search', 'go to file', '搜索文件'],
-            defaults: {
-              'desktop:macos': mk('macos'),
-              'desktop:windows': mk('windows'),
-              'desktop:linux': mk('linux'),
-              'web:macos': mk('macos'),
-              'web:windows': mk('windows'),
-            },
-            regions: ['page', 'editable'],
-            modals: [],
-            resolve: () => {
-              const current = store.get();
-              // 正在录制新快捷键时，别让当前快捷键把窗口开关掉
-              if (current.capturing) return { status: 'handled', run: () => {} };
-              const sid = current.sessionId || ctx.sidebarRight.mounted.getSnapshot();
-              if (!sid) return { status: 'blocked', reason: t('needSession') };
-              return {
-                status: 'handled',
-                run: () => store.set({ open: !current.open, sessionId: sid, settingsOpen: false }),
-              };
-            },
+          disposeCurrent = null;
+        };
+        const register = (spec) => {
+          release();
+          // 按平台生成合法绑定：mac 上 control 映射成 primary，其他平台 primary 映射成 control。
+          const mk = (platform) => ({
+            code: spec.code,
+            modifiers: spec.modifiers.map((mod) => (
+              platform === 'macos' ? (mod === 'control' ? 'primary' : mod) : (mod === 'primary' ? 'control' : mod)
+            )),
           });
-        } catch (err) {
-          // 热重载时旧快捷键可能尚未释放，忽略重复注册错误，避免整段 apply 中断
-          disposeShortcut = null;
-        }
-      };
-      ctx.effect(() => {
-        registerShortcut(store.get().spec);
-        return () => {
-          if (disposeShortcut) {
-            try {
-              disposeShortcut();
-            } catch (err) {
-              /* 忽略 */
-            }
-            disposeShortcut = null;
+          // 默认值按平台各用各的：Mac ⌘⇧K，Windows/Linux Ctrl+Alt+K；自定义值才原样跨平台映射。
+          const bindings = sameSpec(spec, DEFAULT_SPEC)
+            ? {
+                'desktop:macos': MAC_DEFAULT_SPEC,
+                'desktop:windows': WIN_DEFAULT_SPEC,
+                'desktop:linux': WIN_DEFAULT_SPEC,
+                'web:macos': MAC_DEFAULT_SPEC,
+                'web:windows': WIN_DEFAULT_SPEC,
+              }
+            : {
+                'desktop:macos': mk('macos'),
+                'desktop:windows': mk('windows'),
+                'desktop:linux': mk('linux'),
+                'web:macos': mk('macos'),
+                'web:windows': mk('windows'),
+              };
+          try {
+            disposeCurrent = ctx.shortcuts.register({
+              id: 'sidebar-file-search.open',
+              label: () => t('shortcutLabel'),
+              aliases: ['search files', 'file search', 'go to file', '搜索文件'],
+              defaults: bindings,
+              regions: ['page', 'editable'],
+              modals: [],
+              resolve: () => {
+                const current = store.get();
+                // 正在录制新快捷键时，别让当前快捷键把窗口开关掉
+                if (current.capturing) return { status: 'handled', run: () => {} };
+                const sessionId = current.sessionId || ctx.sidebarRight.mounted.getSnapshot();
+                if (!sessionId) return { status: 'blocked', reason: t('needSession') };
+                return {
+                  status: 'handled',
+                  run: () => store.set({ open: !current.open, sessionId, settingsOpen: false }),
+                };
+              },
+            });
+          } catch (err) {
+            // 热重载时旧快捷键可能尚未释放，忽略重复注册错误，避免整段 apply 中断
+            disposeCurrent = null;
           }
         };
-      }, 'file-search: shortcut');
+        return { register, dispose: release };
+      })();
+
+      ctx.effect(() => {
+        shortcut.register(store.get().spec);
+        return () => shortcut.dispose();
+      }, 'sidebar-file-search: shortcut');
 
       // 右侧栏是否展开（收起时把按钮一起藏起来）。isExpanded() 是同步读取，
-      // 用低频率轮询保持响应；只在有会话时轮询，开销可忽略。
+      // 用低频轮询保持响应；只在有会话时轮询，开销可忽略。
       function useRightbarShown(sessionId) {
         const read = () => {
           try {
@@ -478,7 +489,10 @@ window.__ModuleLoader__.load({
             setShown(false);
             return undefined;
           }
-          const tick = () => setShown((prev) => (prev === read() ? prev : read()));
+          const tick = () => setShown((prev) => {
+            const next = read();
+            return prev === next ? prev : next;
+          });
           tick();
           const id = window.setInterval(tick, 200);
           return () => window.clearInterval(id);
@@ -486,59 +500,48 @@ window.__ModuleLoader__.load({
         return shown;
       }
 
-      // 浮层：右侧栏右上角按钮 + 悬浮搜索窗（共用一个组件，靠 store 解耦）
-      function Surface(props) {
-        // 右侧栏当前在屏的会话；为 undefined 说明没有会话
-        const sessionId = props.useSidebarMounted((s) => s);
-        const rightbarShown = useRightbarShown(sessionId);
-        const cwd = props.useSessions((state) => (sessionId ? state.byId[sessionId] && state.byId[sessionId].cwd : undefined));
-        const [snap, setSnap] = React.useState(() => store.get());
-        React.useEffect(() => store.subscribe(() => setSnap(store.get())), []);
-        const wrapRef = React.useRef(null);
-
-        // 用真实 DOM 测量右侧栏表头图标排的位置，把胶囊精确贴到它左边；
-        // 面板太窄时切到“仅图标”模式（靠 html[data-dsfs-compact] 触发 CSS），避免压住 tab 标题。
-        // data-dsfs-on 只在按钮真正显示（有会话且右栏展开）时挂上，未显示时不占位。
+      // 把胶囊精确贴到右侧栏表头图标排左侧，并按面板宽度切换“仅图标”模式。
+      function usePillPlacement(sessionId, rightbarShown, wrapRef) {
         React.useEffect(() => {
           const html = document.documentElement;
-          const active = !!(sessionId && rightbarShown);
-          if (!active) {
+          const clear = () => {
             html.removeAttribute('data-dsfs-on');
             html.removeAttribute('data-dsfs-compact');
             html.style.removeProperty('--dsfs-reserve');
+          };
+          if (!(sessionId && rightbarShown)) {
+            clear();
             return undefined;
           }
           const place = () => {
             // 精确锁定当前会话的右栏（可能同时存在多个保留的会话面板）
             let root = null;
             try {
-              root = document.querySelector('[data-sidebar-right-session="' + String(sessionId).replace(/["\\]/g, '\\$&') + '"]');
+              root = document.querySelector(`[data-sidebar-right-session="${String(sessionId).replace(/["\\]/g, '\\$&')}"]`);
             } catch (err) {
               root = null;
             }
             if (!root) {
               const all = document.querySelectorAll('[data-sidebar-right-session]');
-              for (let i = 0; i < all.length; i += 1) {
-                if (all[i].getBoundingClientRect().width > 0) { root = all[i]; break; }
+              for (const element of all) {
+                if (element.getBoundingClientRect().width > 0) { root = element; break; }
               }
             }
             const chrome = root && root.querySelector('[data-dockkit-strip-chrome]');
             html.setAttribute('data-dsfs-on', '');
             if (!chrome) return;
-            // 面板过窄 -> 仅图标模式，避免胶囊挤掉 tab 标题
             const compact = (root.clientWidth || 0) < 360;
             if (compact) html.setAttribute('data-dsfs-compact', '');
             else html.removeAttribute('data-dsfs-compact');
-            const el = wrapRef.current;
-            if (!el) return;
-            // 按胶囊真实宽度预留空白（中英文/不同系统都适配）
-            const pillW = el.getBoundingClientRect().width || 0;
-            // 预留 = 胶囊宽度 + 8：让胶囊与左右相邻图标都恰好间隔 8px（同原生 stripChrome gap:8）
-            html.style.setProperty('--dsfs-reserve', Math.ceil(pillW + 8) + 'px');
+            const element = wrapRef.current;
+            if (!element) return;
+            const pillWidth = element.getBoundingClientRect().width || 0;
+            // 预留 = 胶囊宽度 + 8：胶囊与左右相邻图标都恰好间隔 8px（同原生 stripChrome gap:8）
+            html.style.setProperty('--dsfs-reserve', Math.ceil(pillWidth + 8) + 'px');
             const pad = parseFloat(window.getComputedStyle(chrome).paddingLeft) || 0;
             const rect = chrome.getBoundingClientRect();
-            el.style.top = rect.top + 'px';
-            el.style.right = window.innerWidth - (rect.left + pad) + 8 + 'px';
+            element.style.top = rect.top + 'px';
+            element.style.right = window.innerWidth - (rect.left + pad) + 8 + 'px';
           };
           place();
           const id = window.setInterval(place, 300);
@@ -546,11 +549,84 @@ window.__ModuleLoader__.load({
           return () => {
             window.clearInterval(id);
             window.removeEventListener('resize', place);
-            html.removeAttribute('data-dsfs-on');
-            html.removeAttribute('data-dsfs-compact');
-            html.style.removeProperty('--dsfs-reserve');
+            clear();
           };
         }, [rightbarShown, sessionId]);
+      }
+
+      // 右上角小胶囊
+      function TriggerPill({ wrapRef, shortcutText, onClick }) {
+        return h(
+          'div',
+          { className: 'dsfs-triggerwrap', ref: wrapRef },
+          h(
+            'button',
+            { type: 'button', className: 'dsfs-trigger', title: t('triggerTitle'), 'aria-label': t('triggerTitle'), onClick },
+            h(SearchGlyph),
+            h('span', { className: 'dsfs-trigger-label' }, t('trigger')),
+            h('kbd', { className: 'dsfs-trigger-kbd' }, shortcutText),
+          ),
+        );
+      }
+
+      // 结果行：文件名优先，目录压缩后置；选中行展示完整路径（含文件名，不压缩、可换行）。
+      function ResultRow({ candidate, active, query, onHover, onChoose }) {
+        const { full, dir, base } = splitPath(candidate.path);
+        return h(
+          'div',
+          {
+            className: 'dsfs-item' + (active ? ' is-active' : ''),
+            role: 'option',
+            'aria-selected': active,
+            'data-active': active ? 'true' : 'false',
+            onMouseEnter: onHover,
+            onMouseDown: (event) => {
+              event.preventDefault();
+              onChoose(candidate);
+            },
+          },
+          candidate.kind === 'directory' ? h(FolderGlyph) : h(FileGlyph),
+          h(
+            'span',
+            { className: 'dsfs-name', title: candidate.path },
+            renderHits(base, query),
+            candidate.kind === 'directory' ? h('span', { className: 'dsfs-name-slash' }, '/') : null,
+          ),
+          active || dir
+            ? h(
+                'span',
+                { className: 'dsfs-dir', title: active ? full : dir },
+                renderDir(active ? full : dir, query, active, full),
+              )
+            : null,
+          active
+            ? h('span', { className: 'dsfs-item-hint' }, h('kbd', null, 'Tab'), ' ', t('insertHint'))
+            : null,
+        );
+      }
+
+      // 全窗口遮罩：点空白处关闭
+      function Overlay({ onDismiss, children }) {
+        return h(
+          'div',
+          {
+            className: 'dsfs-overlay',
+            onMouseDown: (event) => {
+              if (event.target === event.currentTarget) onDismiss();
+            },
+          },
+          children,
+        );
+      }
+
+      // 浮层：右侧栏按钮 + 搜索窗（共用 store）
+      function Surface(props) {
+        const sessionId = props.useSidebarMounted((session) => session);
+        const rightbarShown = useRightbarShown(sessionId);
+        const cwd = props.useSessions((state) => (sessionId ? state.byId[sessionId] && state.byId[sessionId].cwd : undefined));
+        const snapshot = useStoreSnapshot();
+        const wrapRef = React.useRef(null);
+        usePillPlacement(sessionId, rightbarShown, wrapRef);
 
         // 把当前会话上下文写进共享 store，供弹窗与快捷键共用
         React.useEffect(() => {
@@ -559,40 +635,26 @@ window.__ModuleLoader__.load({
         }, [sessionId, cwd]);
 
         const openDialog = () => store.set({ open: true, sessionId: sessionId || null, cwd, settingsOpen: false });
-        const shortcutText = specToText(snap.spec);
 
         return h(
           React.Fragment,
           null,
           sessionId && rightbarShown
-            ? h(
-                'div',
-                { className: 'dsfs-triggerwrap', ref: wrapRef },
-                h(
-                  'button',
-                  { type: 'button', className: 'dsfs-trigger', title: t('triggerTitle'), 'aria-label': t('triggerTitle'), onClick: openDialog },
-                  h(SearchGlyph),
-                  h('span', { className: 'dsfs-trigger-label' }, t('trigger')),
-                  h('kbd', { className: 'dsfs-trigger-kbd' }, shortcutText),
-                ),
-              )
+            ? h(TriggerPill, { wrapRef, shortcutText: specToText(snapshot.spec), onClick: openDialog })
             : null,
-          h(SearchDialog, { snap }),
+          h(SearchDialog, { snapshot }),
         );
       }
 
       // 悬浮搜索窗
-      function SearchDialog(props) {
-        const [snap, setSnap] = React.useState(() => store.get());
-        React.useEffect(() => store.subscribe(() => setSnap(store.get())), []);
-
+      function SearchDialog({ snapshot }) {
         const [query, setQuery] = React.useState('');
         const [results, setResults] = React.useState([]);
         const [loading, setLoading] = React.useState(false);
         const [active, setActive] = React.useState(0);
         const inputRef = React.useRef(null);
         const listRef = React.useRef(null);
-        const open = snap.open;
+        const open = snapshot.open;
 
         // 打开时清空并聚焦输入框
         React.useEffect(() => {
@@ -608,81 +670,71 @@ window.__ModuleLoader__.load({
         // 搜索：防抖 120ms + AbortController 取消旧请求
         React.useEffect(() => {
           if (!open) return undefined;
-          const q = query.trim();
-          if (!q) {
+          const keyword = query.trim();
+          if (!keyword) {
             setResults([]);
             setLoading(false);
             setActive(0);
             return undefined;
           }
           setLoading(true);
-          const ac = new AbortController();
+          const controller = new AbortController();
           const timer = window.setTimeout(() => {
-            if (!snap.sessionId) {
+            if (!snapshot.sessionId) {
               setResults([]);
               setLoading(false);
               return;
             }
-            let pending;
-            try {
-              pending = ctx.remote.fileReferences.list(snap.sessionId, q, ac.signal);
-            } catch (err) {
-              setResults([]);
-              setLoading(false);
-              return;
-            }
-            Promise.resolve(pending)
-              .then((r) => {
-                if (ac.signal.aborted) return;
-                const arr = Array.isArray(r) ? r : r && r.ok && Array.isArray(r.value) ? r.value : [];
-                setResults(rankResults(arr, q));
+            // 含 “/” 的查询在系统引擎里只列该目录的直接子项；额外用去斜杠版本做一次
+            // 全量模糊查询，保证 todo-common/todo-common-json/java 能命中子目录文件。
+            const request = (text) => {
+              try {
+                return Promise.resolve(ctx.remote.fileReferences.list(snapshot.sessionId, text, controller.signal)).catch(() => null);
+              } catch (err) {
+                return Promise.resolve(null);
+              }
+            };
+            const requests = [request(keyword)];
+            const flat = keyword.replace(/[\\/]/g, '');
+            if (flat && flat !== keyword) requests.push(request(flat));
+            Promise.all(requests)
+              .then((responses) => {
+                if (controller.signal.aborted) return;
+                const seen = new Set();
+                const candidates = [];
+                for (const response of responses) {
+                  const list = Array.isArray(response) ? response : response && response.ok && Array.isArray(response.value) ? response.value : [];
+                  for (const candidate of list) {
+                    const key = `${candidate.path}|${candidate.kind}`;
+                    if (!seen.has(key)) { seen.add(key); candidates.push(candidate); }
+                  }
+                }
+                setResults(rankResults(candidates, keyword));
                 setActive(0);
                 setLoading(false);
               })
               .catch(() => {
-                if (ac.signal.aborted) return;
+                if (controller.signal.aborted) return;
                 setResults([]);
                 setLoading(false);
               });
           }, 120);
           return () => {
             window.clearTimeout(timer);
-            ac.abort();
+            controller.abort();
           };
-        }, [open, query, snap.sessionId]);
-
-        // 键盘：↑↓ 切换、↵ 打开、Tab 插入到输入框、esc 关闭
-        const onKeyDown = (e) => {
-          if (e.key === 'Escape') {
-            e.preventDefault();
-            store.set({ open: false });
-            return;
-          }
-          if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            setActive((i) => (results.length ? (i + 1) % results.length : 0));
-          } else if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            setActive((i) => (results.length ? (i - 1 + results.length) % results.length : 0));
-          } else if (e.key === 'Enter') {
-            e.preventDefault();
-            choose(results[active]);
-          } else if (e.key === 'Tab') {
-            e.preventDefault();
-            insert(results[active]);
-          }
-        };
+        }, [open, query, snapshot.sessionId]);
 
         // 选中：文件夹下钻，文件在右侧打开
-        const choose = (cand) => {
-          if (!cand) return;
-          if (cand.kind === 'directory') {
-            setQuery(cand.path.replace(/\/+$/, '') + '/');
+        const choose = (candidate) => {
+          if (!candidate) return;
+          if (candidate.kind === 'directory') {
+            setQuery(candidate.path.replace(/\/+$/, '') + '/');
             window.setTimeout(() => inputRef.current && inputRef.current.focus(), 0);
             return;
           }
           try {
-            const url = fileAddressFor(snap.sessionId, snap.cwd, resolveWorkspacePath(snap.cwd, cand.path));
+            const url = fileAddressFor(snapshot.sessionId, snapshot.cwd, resolveWorkspacePath(snapshot.cwd, candidate.path));
             ctx.sidebarRight.openResource(url);
           } catch (err) {
             /* 打开失败时静默，不打断输入 */
@@ -690,17 +742,17 @@ window.__ModuleLoader__.load({
           store.set({ open: false });
         };
 
-        // 插入：把选中的路径以 @ 引用形式写进当前会话的输入框（Tab 触发）
-        const insert = (cand) => {
-          if (!cand) return;
+        // Tab：把选中路径以 @ 引用写进当前会话输入框
+        const insert = (candidate) => {
+          if (!candidate) return;
           const value = ctx.uiSession ? ctx.uiSession.current.getSnapshot() : null;
           const actions = value && value.props && value.props.inputActions;
-          if (!actions || value.key !== snap.sessionId) return;
-          const ref = cand.path + (cand.kind === 'directory' ? '/' : '');
-          const text = /\s/.test(cand.path) ? '@"' + ref + '" ' : '@' + ref + ' ';
+          if (!actions || value.key !== snapshot.sessionId) return;
+          const ref = candidate.path + (candidate.kind === 'directory' ? '/' : '');
+          const text = /\s/.test(candidate.path) ? '@"' + ref + '" ' : '@' + ref + ' ';
           try {
             if (actions.insertText(text, actions.captureInsertion())) {
-              focusComposer(); // 插入后光标回到对话输入框，可直接继续打字
+              focusComposer();
               store.set({ open: false });
             }
           } catch (err) {
@@ -708,40 +760,59 @@ window.__ModuleLoader__.load({
           }
         };
 
+        // 键盘：↑↓ 切换、↵ 打开、Tab 插入、esc 关闭
+        const onKeyDown = (event) => {
+          switch (event.key) {
+            case 'Escape':
+              event.preventDefault();
+              store.set({ open: false });
+              break;
+            case 'ArrowDown':
+              event.preventDefault();
+              setActive((index) => (results.length ? (index + 1) % results.length : 0));
+              break;
+            case 'ArrowUp':
+              event.preventDefault();
+              setActive((index) => (results.length ? (index - 1 + results.length) % results.length : 0));
+              break;
+            case 'Enter':
+              event.preventDefault();
+              choose(results[active]);
+              break;
+            case 'Tab':
+              event.preventDefault();
+              insert(results[active]);
+              break;
+            default:
+              break;
+          }
+        };
+
         // 让高亮行始终可见
         React.useEffect(() => {
           if (!open || !listRef.current) return;
-          const el = listRef.current.querySelector('[data-active="true"]');
-          if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+          const element = listRef.current.querySelector('[data-active="true"]');
+          if (element && element.scrollIntoView) element.scrollIntoView({ block: 'nearest' });
         }, [active, results, open]);
 
         if (!open) return null;
 
         // 设置弹窗（从底栏齿轮进入），与搜索窗共用遮罩
-        if (snap.settingsOpen) {
+        if (snapshot.settingsOpen) {
           return h(
-            'div',
-            {
-              className: 'dsfs-overlay',
-              onMouseDown: (e) => {
-                if (e.target === e.currentTarget) store.set({ settingsOpen: false });
-              },
-            },
-            h(SettingsDialog, { onClose: () => store.set({ settingsOpen: false }) }),
+            Overlay,
+            { onDismiss: () => store.set({ settingsOpen: false }) },
+            h(SettingsDialog, { snapshot, onClose: () => store.set({ settingsOpen: false }) }),
           );
         }
 
-        const showHint = !query.trim();
-        const showEmpty = !showHint && !loading && results.length === 0;
+        const hasQuery = Boolean(query.trim());
+        const showHint = !hasQuery;
+        const showEmpty = hasQuery && !loading && results.length === 0;
 
         return h(
-          'div',
-          {
-            className: 'dsfs-overlay',
-            onMouseDown: (e) => {
-              if (e.target === e.currentTarget) store.set({ open: false, settingsOpen: false });
-            },
-          },
+          Overlay,
+          { onDismiss: () => store.set({ open: false, settingsOpen: false }) },
           h(
             'div',
             { className: 'dsfs-dialog', role: 'dialog', 'aria-modal': 'true', 'aria-label': t('triggerTitle') },
@@ -756,7 +827,7 @@ window.__ModuleLoader__.load({
                 placeholder: t('placeholder'),
                 spellCheck: false,
                 autoComplete: 'off',
-                onChange: (e) => setQuery(e.target.value),
+                onChange: (event) => setQuery(event.target.value),
                 onKeyDown,
               }),
               loading ? h('span', { className: 'dsfs-spinner' }) : null,
@@ -767,53 +838,16 @@ window.__ModuleLoader__.load({
               showHint
                 ? h('div', { className: 'dsfs-empty' }, t('hint'))
                 : showEmpty
-                  ? h('div', { className: 'dsfs-empty' }, loading ? t('loading') : t('empty'))
-                  : results.map((c, i) => {
-                      const full = String(c.path || '').replace(/\\/g, '/');
-                      const cut = full.lastIndexOf('/');
-                      const dir = cut < 0 ? '' : full.slice(0, cut);
-                      const base = full.slice(cut + 1);
-                      return h(
-                        'div',
-                        {
-                          key: `${c.path}|${c.kind}|${i}`,
-                          className: 'dsfs-item' + (i === active ? ' is-active' : ''),
-                          role: 'option',
-                          'aria-selected': i === active,
-                          'data-active': i === active ? 'true' : 'false',
-                          onMouseEnter: () => setActive(i),
-                          onMouseDown: (e) => {
-                            e.preventDefault();
-                            choose(c);
-                          },
-                        },
-                        c.kind === 'directory' ? h(FolderGlyph) : h(FileGlyph),
-                        // 文件名优先，目录压缩后放在右侧（VS Code 快速打开的感觉）
-                        h(
-                          'span',
-                          { className: 'dsfs-name', title: c.path },
-                          renderHits(base, query),
-                          c.kind === 'directory' ? h('span', { className: 'dsfs-name-slash' }, '/') : null,
-                        ),
-                        // 选中行展示完整路径（含文件名，不压缩、可换行），其余行展示压缩目录
-                        i === active || dir
-                          ? h(
-                              'span',
-                              { className: 'dsfs-dir', title: i === active ? full : dir },
-                              renderDir(i === active ? full : dir, query, i === active, full),
-                            )
-                          : null,
-                        i === active
-                          ? h(
-                              'span',
-                              { className: 'dsfs-item-hint' },
-                              h('kbd', null, 'Tab'),
-                              ' ',
-                              t('insertHint'),
-                            )
-                          : null,
-                      );
-                    }),
+                  ? h('div', { className: 'dsfs-empty' }, t('empty'))
+                  : results.map((candidate, index) =>
+                      h(ResultRow, {
+                        key: `${candidate.path}|${candidate.kind}|${index}`,
+                        candidate,
+                        active: index === active,
+                        query,
+                        onHover: () => setActive(index),
+                        onChoose: choose,
+                      })),
             ),
             h(
               'div',
@@ -822,7 +856,7 @@ window.__ModuleLoader__.load({
               h('span', { className: 'dsfs-foot-item' }, h('kbd', null, '↵'), ' ', t('select')),
               h('span', { className: 'dsfs-foot-item' }, h('kbd', null, 'esc'), ' ', t('close')),
               h('span', { className: 'dsfs-foot-grow' }),
-              h('span', { className: 'dsfs-foot-item dsfs-foot-shortcut' }, h('kbd', null, specToText(snap.spec)), ' ', t('shortcut')),
+              h('span', { className: 'dsfs-foot-item dsfs-foot-shortcut' }, h('kbd', null, specToText(snapshot.spec)), ' ', t('shortcut')),
               h(
                 'button',
                 {
@@ -839,19 +873,16 @@ window.__ModuleLoader__.load({
         );
       }
 
-      // 设置弹窗：修改打开搜索窗的快捷键（点按钮后按下新组合键即保存）
-      function SettingsDialog(props) {
-        const [snap, setSnap] = React.useState(() => store.get());
-        React.useEffect(() => store.subscribe(() => setSnap(store.get())), []);
+      // 设置弹窗：修改打开搜索窗的快捷键
+      function SettingsDialog({ snapshot, onClose }) {
         const [capturing, setCapturing] = React.useState(false);
         const [error, setError] = React.useState('');
         const [preview, setPreview] = React.useState('');
         const held = React.useRef(new Set());
 
-        // 当前按住的修饰键 → modifier 名称列表
         const heldMods = () => {
           const mods = [];
-          if (held.current.has(isMac ? 'Meta' : 'Control')) mods.push('primary');
+          if (held.current.has(IS_MAC ? 'Meta' : 'Control')) mods.push('primary');
           if (held.current.has('Alt')) mods.push('alt');
           if (held.current.has('Shift')) mods.push('shift');
           return mods;
@@ -870,27 +901,26 @@ window.__ModuleLoader__.load({
         // 捕获键盘组合；录制中实时把按下的键显示在按钮里
         React.useEffect(() => {
           if (!capturing) return undefined;
-          const pure = ['Meta', 'Control', 'Alt', 'Shift', 'CapsLock'];
-          const onKeyDown = (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
-            if (e.repeat) return;
-            if (pure.indexOf(e.key) >= 0) {
-              held.current.add(e.key); // 只按了修饰键，先实时显示
+          const onKeyDown = (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+            if (event.repeat) return;
+            if (PURE_MODIFIER_KEYS.includes(event.key)) {
+              held.current.add(event.key);
               setPreview(modsToText(heldMods()));
               return;
             }
             // 合并“真实按住的键”与事件自身修饰位，避免漏记
             const mods = heldMods();
-            const add = (m, on) => {
-              if (on && mods.indexOf(m) < 0) mods.push(m);
+            const add = (mod, pressed) => {
+              if (pressed && !mods.includes(mod)) mods.push(mod);
             };
-            add('primary', isMac ? e.metaKey : e.ctrlKey);
-            add('alt', e.altKey);
-            add('shift', e.shiftKey);
-            setPreview(specToText({ code: e.code, modifiers: mods }));
-            if (e.key === 'Escape' && mods.length === 0) {
+            add('primary', IS_MAC ? event.metaKey : event.ctrlKey);
+            add('alt', event.altKey);
+            add('shift', event.shiftKey);
+            setPreview(specToText({ code: event.code, modifiers: mods }));
+            if (event.key === 'Escape' && mods.length === 0) {
               setCapturing(false);
               setError('');
               return;
@@ -899,16 +929,16 @@ window.__ModuleLoader__.load({
               setError(t('needMod'));
               return;
             }
-            const spec = { code: e.code, modifiers: mods };
+            const spec = { code: event.code, modifiers: mods };
             saveSpec(spec);
             store.set({ spec });
-            registerShortcut(spec);
+            shortcut.register(spec);
             setCapturing(false);
             setError('');
           };
-          const onKeyUp = (e) => {
-            if (pure.indexOf(e.key) < 0) return;
-            held.current.delete(e.key);
+          const onKeyUp = (event) => {
+            if (!PURE_MODIFIER_KEYS.includes(event.key)) return;
+            held.current.delete(event.key);
             setPreview(modsToText(heldMods()));
           };
           window.addEventListener('keydown', onKeyDown, true);
@@ -924,7 +954,7 @@ window.__ModuleLoader__.load({
         const reset = () => {
           saveSpec(DEFAULT_SPEC);
           store.set({ spec: DEFAULT_SPEC });
-          registerShortcut(DEFAULT_SPEC);
+          shortcut.register(DEFAULT_SPEC);
           setError('');
         };
 
@@ -952,7 +982,7 @@ window.__ModuleLoader__.load({
                     setCapturing(true);
                   },
                 },
-                capturing ? preview || t('pressKeys') : specToText(snap.spec),
+                capturing ? preview || t('pressKeys') : specToText(snapshot.spec),
               ),
             ),
             error ? h('div', { className: 'dsfs-set-error' }, error) : null,
@@ -962,7 +992,7 @@ window.__ModuleLoader__.load({
             { className: 'dsfs-set-foot' },
             h('button', { type: 'button', className: 'dsfs-btn', onClick: reset }, t('reset')),
             h('span', { className: 'dsfs-foot-grow' }),
-            h('button', { type: 'button', className: 'dsfs-btn is-primary', onClick: props.onClose }, t('done')),
+            h('button', { type: 'button', className: 'dsfs-btn is-primary', onClick: onClose }, t('done')),
           ),
         );
       }
@@ -972,7 +1002,7 @@ window.__ModuleLoader__.load({
         ctx.slots.register(
           {
             name: 'shell.overlay',
-            id: 'file-search',
+            id: 'sidebar-file-search',
             order: 300,
             inject: () => ({ hooks: { sidebarMounted: ctx.sidebarRight.mounted } }),
           },

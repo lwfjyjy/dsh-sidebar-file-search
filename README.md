@@ -1,4 +1,4 @@
-# dsh-file-search
+# dsh-sidebar-file-search
 
 DSH 插件：在**右侧栏右上角那排图标（分屏 / 全屏 / 收起）左侧**显示一个「🔍 搜索 ⌘⇧K / Ctrl+Alt+K」小胶囊，点开是 **Vite 风格悬浮搜索窗**，按路径做**顺序模糊匹配**（例如输入 `acea` 也能命中 `abcdefg/abcdefg`），选中文件后在**右侧预览**打开，选中文件夹则**逐层下钻**。
 

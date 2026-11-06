@@ -1,7 +1,7 @@
 {
-  "name": "@lwfjyjy/dsh-file-search",
+  "name": "@lwfjyjy/dsh-sidebar-file-search",
   "version": "0.1.0",
-  "description": "DSH 插件：会话顶栏搜索按钮 + Vite 风格悬浮窗，按路径顺序模糊搜索工作区文件/文件夹，选中后在右侧预览打开。",
+  "description": "DSH 插件：右侧栏右上角搜索按钮 + Vite 风格悬浮窗，按路径顺序模糊搜索工作区文件/文件夹，选中后在右侧预览打开。",
   "type": "module",
   "license": "MIT",
   "author": "lwfjyjy",
