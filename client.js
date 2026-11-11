@@ -781,6 +781,9 @@ window.__ModuleLoader__.load({
 
         // 键盘：↑↓ 切换、↵ 打开、Tab 插入、esc 关闭
         const onKeyDown = (event) => {
+          // 输入法选词中（例如按回车确认拼音候选）：按键交给输入法，不能当成「打开/插入」
+          const native = event.nativeEvent;
+          if ((native && native.isComposing) || event.keyCode === 229 || (native && native.keyCode === 229)) return;
           switch (event.key) {
             case 'Escape':
               event.preventDefault();
